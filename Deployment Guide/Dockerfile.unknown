@@ -1,0 +1,120 @@
+# Use Ubuntu 24.04 as the base image
+FROM ubuntu:24.04
+SHELL ["/bin/bash", "-c"]
+
+ARG TZ="UTC"
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone
+
+WORKDIR /usr/src/app
+
+# Ensure the user cloned Caldera recursively
+ADD . .
+RUN if [ -z "$(ls plugins/stockpile)" ]; then \
+    echo "Stockpile plugin not downloaded - please ensure you recursively cloned the Caldera git repository and try again."; \
+    exit 1; \
+fi
+
+# Set non-interactive mode to avoid prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y python3 python3-pip python3-venv git curl golang-go && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# WIN_BUILD is used to enable Windows build in sandcat plugin
+ARG WIN_BUILD=false
+RUN if [ "$WIN_BUILD" = "true" ]; then \
+    apt-get update && \
+    apt-get install -y mingw-w64 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*; \
+fi
+
+# Set up Python virtual environment (to avoid PEP 668 error)
+ENV VIRTUAL_ENV=/opt/venv/caldera
+RUN python3 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Upgrade pip & install setuptools inside virtualenv
+RUN $VIRTUAL_ENV/bin/pip install --upgrade pip setuptools
+
+# Install Caldera dependencies inside virtual environment
+RUN $VIRTUAL_ENV/bin/pip install --no-cache-dir -r requirements.txt
+
+# Set up config file and disable atomic by default
+RUN $VIRTUAL_ENV/bin/python -c "import app; import app.utility.config_generator; app.utility.config_generator.ensure_local_config();" && \
+    sed -i '/\- atomic/d' conf/local.yml;
+
+# Compile default sandcat agent binaries
+WORKDIR /usr/src/app/plugins/sandcat/gocat
+RUN go mod tidy && go mod download
+
+WORKDIR /usr/src/app/plugins/sandcat
+
+# Fix line endings for Windows compatibility
+RUN if [ "$WIN_BUILD" = "true" ]; then \
+    cp ./update-agents.sh ./update-agents-copy.sh && \
+    tr -d '\15\32' < ./update-agents-copy.sh > ./update-agents.sh && \
+    rm ./update-agents-copy.sh; \
+fi
+
+RUN ./update-agents.sh
+
+# Clone Atomic Red Team repo for the atomic plugin
+RUN if [ ! -d "/usr/src/app/plugins/atomic/data/atomic-red-team" ]; then \
+    git clone --depth 1 https://github.com/redcanaryco/atomic-red-team.git \
+        /usr/src/app/plugins/atomic/data/atomic-red-team; \
+fi
+
+# Handle Emu plugin dependencies
+WORKDIR /usr/src/app/plugins/emu
+
+# Ensure the "emu" plugin is enabled before installing dependencies
+RUN if grep -q "\- emu" ../../conf/local.yml; then \
+    apt-get update && \
+    apt-get -y install zlib1g unzip && \
+    /opt/venv/caldera/bin/pip install -r requirements.txt && \
+    chmod +x download_payloads.sh && \
+    ./download_payloads.sh; \
+fi
+
+WORKDIR /usr/src/app
+
+# Install Node.js and build VueJS front-end
+RUN apt-get update && \
+    apt-get install -y nodejs npm && \
+    (cd plugins/magma && npm install) && \
+    (cd plugins/magma && npm run build) && \
+    apt-get remove -y nodejs npm && \
+    apt-get autoremove -y && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+WORKDIR /usr/src/app
+
+STOPSIGNAL SIGINT
+
+# Default HTTP port for web interface and agent beacons over HTTP
+EXPOSE 8888
+
+# Default HTTPS port for web interface and agent beacons over HTTPS (requires SSL plugin to be enabled)
+EXPOSE 8443
+
+# TCP and UDP contact ports
+EXPOSE 7010
+EXPOSE 7011/udp
+
+# Websocket contact port
+EXPOSE 7012
+
+# Default port to listen for DNS requests for DNS tunneling C2 channel
+EXPOSE 8853
+
+# Default port to listen for SSH tunneling requests
+EXPOSE 8022
+
+# Default FTP port for FTP C2 channel
+EXPOSE 2222
+
+# Start Caldera using virtual environment Python
+ENTRYPOINT ["/opt/venv/caldera/bin/python", "server.py"]
